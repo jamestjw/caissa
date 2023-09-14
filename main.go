@@ -1,15 +1,19 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log"
+	"mime/multipart"
 	"net/http"
 	"os"
 	"os/signal"
+	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/bwmarrin/discordgo"
@@ -102,10 +106,13 @@ var (
 		},
 		"elo": eloCommandHandler,
 	}
+	fqeMemberListRegex = regexp.MustCompile(`<a href="index\.php\?Id=(\d+)">(.*?)<\/a>`)
 )
 
 func eloCommandHandler(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	var playerId int
+	var playerFirstName string
+	var playerLastName string
 	// Access options in the order provided by the user.
 	options := i.ApplicationCommandData().Options
 
@@ -118,28 +125,22 @@ func eloCommandHandler(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	// This example stores the provided arguments in an []interface{}
 	// which will be used to format the bot's response
 	margs := make([]interface{}, 0, len(options))
-	responseHeader := "Retrieving elo for"
 
 	// Get the value from the option map.
 	// When the option exists, ok = true
 	if opt, ok := optionMap["firstname"]; ok {
-		// Option values must be type asserted from interface{}.
-		// Discordgo provides utility functions to make this simple.
-		margs = append(margs, opt.StringValue())
-		responseHeader += " %s"
+		playerFirstName = opt.StringValue()
+		margs = append(margs, playerFirstName)
 	}
 
 	if opt, ok := optionMap["lastname"]; ok {
-		// Option values must be type asserted from interface{}.
-		// Discordgo provides utility functions to make this simple.
-		margs = append(margs, opt.StringValue())
-		responseHeader += " %s"
+		playerLastName = opt.StringValue()
+		margs = append(margs, playerLastName)
 	}
 
 	if opt, ok := optionMap["id"]; ok {
 		playerId = int(opt.IntValue())
 		margs = append(margs, playerId)
-		responseHeader += " ID: %d"
 	}
 
 	var response string
@@ -147,24 +148,36 @@ func eloCommandHandler(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	if len(margs) == 0 {
 		response = "At least one option is required!"
 	} else {
-		response = fmt.Sprintf(responseHeader, margs...)
-	}
+		foundPlayers, err := searchFqeMember(playerFirstName, playerLastName, playerId)
 
-	if playerId != 0 {
-		player, err := getFqePlayerRating(playerId)
-		var playerString string
 		if err != nil {
-			playerString = fmt.Sprintln("Error getting player info:", err)
+			response = fmt.Sprintln("Failed to search for player", err)
+		} else if len(foundPlayers) == 0 {
+			response = "No players found! :("
+		} else if len(foundPlayers) == 1 {
+			playerDetails := foundPlayers[0]
+
+			player, err := getFqePlayerRating(playerDetails.ID)
+			var playerEloString string
+			if err != nil {
+				playerEloString = fmt.Sprintln("Error getting player ELO info:", err)
+			} else {
+				playerEloString = stringifyPlayer(player)
+			}
+
+			response = response + fmt.Sprintf("\nName: %s\nID: %d\n\nFQE rating:\n%s",
+				playerDetails.Name, playerDetails.ID, playerEloString)
 		} else {
-			playerString = stringifyPlayer(player)
+			var playerStrings []string
+			for _, player := range foundPlayers {
+				playerStrings = append(playerStrings, fmt.Sprintf("%s, %d", player.Name, player.ID))
+			}
+
+			response = "Found players:\n" + strings.Join(playerStrings, "\n")
 		}
-		response = response + "\nFQE rating:\n" + playerString
-	} else {
-		response = response + "\nFor now, FQE ID is required to fetch ELO"
 	}
 
 	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
-		// Ignore type for now, they will be discussed in "responses"
 		Type: discordgo.InteractionResponseChannelMessageWithSource,
 		Data: &discordgo.InteractionResponseData{
 			Content: response},
@@ -289,4 +302,51 @@ func stringifyPlayer(player Player) string {
 		eloStrings = append(eloStrings, eloString)
 	}
 	return strings.Join(eloStrings[:], "\n")
+}
+
+type PlayerSearchResult struct {
+	Name string
+	ID   int
+}
+
+func searchFqeMember(firstname string, lastname string, id int) ([]PlayerSearchResult, error) {
+	var res []PlayerSearchResult
+
+	body := new(bytes.Buffer)
+	mp := multipart.NewWriter(body)
+
+	if firstname != "" {
+		mp.WriteField("FName", firstname)
+	}
+	if lastname != "" {
+		mp.WriteField("Name", lastname)
+	}
+	if id != 0 {
+		mp.WriteField("Matricule", fmt.Sprint(id))
+	}
+	ct := mp.FormDataContentType()
+	mp.Close()
+
+	resp, err := http.Post("https://www.fqechecs.qc.ca/membres/list-membres.php?c=Qui", ct, body)
+
+	if err != nil {
+		return res, errors.New("Request failed")
+	}
+
+	respBody, err := io.ReadAll(resp.Body)
+
+	if err != nil {
+		return res, errors.New("Error parsing response body")
+	}
+
+	matches := fqeMemberListRegex.FindAllStringSubmatch(string(respBody), -1)
+	for _, v := range matches {
+		id, err := strconv.ParseInt(v[1], 10, 32)
+		if err != nil {
+			return res, errors.New("Invalid FQE ID")
+		}
+		res = append(res, PlayerSearchResult{Name: v[2], ID: int(id)})
+	}
+
+	return res, nil
 }
